@@ -65,12 +65,19 @@ The image includes a pinned Playwright package and Chromium. Researchers can use
 `squad-browser` through `bash` when a public page needs JavaScript, scrolling,
 or ordinary link/button/search-form navigation. Each invocation opens a fresh
 headless browser context with no saved cookies, credentials, downloads, or
-profile. Workflows accept at most 12 actions and return at most 12,000
-characters of visible page text plus the final and visited URLs:
+profile. Workflows accept at most 12 actions. After the actions, the runner
+scrolls through the page so lazily loaded sections render, then extracts the
+visible text, including open shadow roots, where web components such as MDN's
+compatibility tables render. It prints one `HVE_BROWSER_RESULT` metadata line
+(title, final and visited URLs, actions, blocked requests), then up to 30,000
+characters of page text and the visible links as plain text:
 
 ```bash
 printf '%s' '{"url":"https://example.org/page","steps":[{"action":"click","role":"link","name":"Full text"}]}' | squad-browser
 ```
+
+The agent runtime starts the shell from an allowlisted environment, so the
+launcher sets `PLAYWRIGHT_BROWSERS_PATH` itself.
 
 Supported actions are `navigate`, `click` (by accessible role/name, label, or
 exact text), `fill` (non-password fields only), `press` (Enter, Tab, arrows,
@@ -84,9 +91,12 @@ This is normal public-page navigation, not a way around sign-in, a paywall,
 CAPTCHA, or other access controls. It cannot reuse a user's browser profile or
 cookies. If content still requires human authentication or interaction, the
 researcher must report that gap rather than claim to have read it. Browser
-results are recorded as sandbox-tool evidence with the visited page URLs; the
-server does not independently fetch or verify their contents, and the URL
-metadata is reported by the sandbox rather than cryptographically attested.
+results are recorded as sandbox-tool evidence: `browser-reported:` with the
+visited page URLs when the output came straight back, or
+`browser-output-redirected:` with the requested URLs when the agent redirected
+or filtered it (that receipt does not hold the page text). The server does not
+independently fetch or verify their contents, and the URL metadata is reported
+by the sandbox rather than cryptographically attested.
 
 ## Run it locally
 

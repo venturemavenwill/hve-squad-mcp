@@ -192,10 +192,12 @@ export const TEXT_ONLY_REPORT_CHARTER = [
   "Write one concise Markdown report to the assigned primary artifact, cite only evidence receipts issued in this stage, then finish.",
 ].join("\n");
 
+// On an agentic runtime each tool round trip is a model call, and the minimum
+// path (read research, read plan, write the report, finish) needs 4-6.
 export const TEXT_ONLY_REPORT_LIMITS = {
   deadlineMs: 90_000,
-  modelCalls: 4,
-  toolCalls: 8,
+  modelCalls: 10,
+  toolCalls: 12,
 } as const;
 
 const MAX_FILE_CHARS = Math.min(64_000, ARTIFACT_MAX_CHARS);

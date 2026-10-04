@@ -38,3 +38,14 @@ test("files executed inside the Linux sandbox use LF line endings", () => {
     assert.ok(!content.includes("\r"), `${name} must not contain CR characters`);
   }
 });
+
+test("a workflow without steps defaults to an empty, iterable list", () => {
+  assert.deepEqual(validateWorkflow({ url: "https://example.com" }).steps, []);
+});
+
+test("the launcher sets the browser path the agent's allowlisted shell does not inherit", () => {
+  const launcher = readFileSync(new URL("./squad-browser", import.meta.url), "utf8");
+  assert.match(launcher, /^export PLAYWRIGHT_BROWSERS_PATH=\/opt\/ms-playwright$/m);
+  const containerfile = readFileSync(new URL("./Containerfile", import.meta.url), "utf8");
+  assert.match(containerfile, /PLAYWRIGHT_BROWSERS_PATH=\/opt\/ms-playwright \S+ install/);
+});
