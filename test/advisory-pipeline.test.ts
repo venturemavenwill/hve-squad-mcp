@@ -55,7 +55,7 @@ const personaStage = (role: string, marker: string, backlog = false): AdvisorySt
   backlog,
 });
 
-/** The five-stage full advisory plan: research -> plan -> council -> review -> backlog. */
+/** A representative advisory plan: research -> plan -> council -> review -> backlog. */
 function fullAdvisoryPlan(): AdvisoryStagePlan[] {
   return [
     personaStage("Squad Researcher", "RESEARCH"),
@@ -303,6 +303,7 @@ function makeAdvisoryCastFixture(): { root: string; cleanup: () => void } {
     writeFileSync(join(root, file), ["---", `name: ${name}`, "---", "", `${name} body.`, ""].join("\n"), "utf8");
   write("squad-researcher.agent.md", "Squad Researcher");
   write("squad-lead.agent.md", "Squad Lead");
+  write("squad-implementor.agent.md", "Squad Implementor");
   write("squad-reviewer.agent.md", "Squad Reviewer");
   write("council-a.agent.md", "Council Member A");
   write("council-b.agent.md", "Council Member B");
@@ -323,7 +324,10 @@ test("planAdvisoryStages interleaves the council and appends backlog-handoff for
       profile: "default",
       fanOut: [],
     };
-    const rosterMap = new Map([["product-owner", "Functional Planner"]]);
+    const rosterMap = new Map([
+      ["developer", "Squad Implementor"],
+      ["product-owner", "Functional Planner"],
+    ]);
     const ordered = planAdvisoryStages(routePlan, [root], rosterMap);
 
     assert.deepEqual(
@@ -332,15 +336,65 @@ test("planAdvisoryStages interleaves the council and appends backlog-handoff for
         "persona:Squad Researcher",
         "persona:Squad Lead",
         "council:Council Verdict",
+        "persona:Squad Implementor",
         "persona:Squad Reviewer",
         "persona:Functional Planner",
       ],
     );
+    assert.equal(ordered[3].roleKey, "developer");
+    assert.equal(ordered[3].executionMode, "text-only-report");
     assert.equal(ordered[2].members?.length, 2);
     assert.equal(ordered.at(-1)?.backlog, true);
   } finally {
     cleanup();
   }
+});
+
+test("deliverable fan-out replaces the single text-only developer report", () => {
+  const { root, cleanup } = makeAdvisoryCastFixture();
+  try {
+    const routePlan: RoutePlan = {
+      stages: [
+        { role: "researcher", agentName: "Squad Researcher", tier: "auto", parallelEligible: true },
+        { role: "lead", agentName: "Squad Lead", tier: "confirm", parallelEligible: false },
+        { role: "tester", agentName: "Squad Reviewer", tier: "auto", parallelEligible: true },
+      ],
+      council: { engaged: false, members: [], missingQuorum: [] },
+      profile: "product",
+      fanOut: [{ role: "developer", agentName: "Squad Implementor", tier: "auto", parallelEligible: false }],
+    };
+    const ordered = planAdvisoryStages(routePlan, [root], new Map());
+    const developer = ordered.find((stage) => stage.role === "Squad Implementor");
+    assert.ok(developer);
+    assert.equal(developer.executionMode, undefined);
+    assert.equal(ordered.filter((stage) => stage.executionMode === "text-only-report").length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("the advisory runner forwards a report-only stage's execution mode to its executor", async () => {
+  const reportStage = {
+    ...personaStage("Squad Implementor", "REPORT"),
+    roleKey: "developer",
+    executionMode: "text-only-report" as const,
+  };
+  let receivedMode: string | undefined;
+  const result = await runAdvisoryPipeline(
+    { toolId: "squad_run", request: "Summarize the completed research." },
+    {
+      backend: new ScriptedBackend([]),
+      stageExecutor: {
+        async execute(_persona, _request, _priorArtifact, _roleKey, _costLedger, executionMode) {
+          receivedMode = executionMode;
+          return { text: "Bounded report", backendId: "report-only", finishReason: "stop" };
+        },
+      },
+    },
+    { plan: [reportStage], mode: "autopilot" },
+  );
+  assert.equal(result.outcome, "completed");
+  assert.equal(receivedMode, "text-only-report");
 });
 
 test("planAdvisoryStages keeps a research-only route to a single research stage", () => {

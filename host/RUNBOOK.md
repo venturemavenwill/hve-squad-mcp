@@ -1563,6 +1563,11 @@ MCP tools. The runtime runs in a sandbox sidecar; the server keeps project
 persistence, evidence, permissions and the GitHub identity. See
 `host/sandbox/README.md` for how it works and what it enforces.
 
+The sandbox image includes pinned Playwright and Chromium. Research uses
+`squad-browser` for public pages that require JavaScript or ordinary
+click/search/scroll navigation; rebuild and deploy both the server and sandbox
+images when changing this fallback or its browser runtime.
+
 Prerequisites: `enableMemory`, `enableMemoryAuto` and `enableArtifacts` set to
 `true` (the server refuses to start otherwise), and a GitHub account with a
 Copilot seat whose token the server can use.
