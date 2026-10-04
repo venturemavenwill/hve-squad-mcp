@@ -1,7 +1,6 @@
 {
   "name": "@hve-squad/mcp",
   "version": "0.6.3",
-  "private": true,
   "type": "module",
   "description": "Outbound Model Context Protocol (MCP) server that exposes the hve-squad as coarse intent tools (squad_research, squad_plan, squad_review, squad_architect, squad_run) plus squad_federate for the opt-in federation of named sub-squads, to MCP hosts such as VS Code GitHub Copilot. Phase 0: local stdio, delegated execution.",
   "license": "MIT",
@@ -26,6 +25,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run build",
     "lint": "tsc --noEmit --pretty false",
     "generate": "tsx generators/build-manifests.ts",
     "generate:check": "tsx generators/build-manifests.ts --check",
@@ -44,21 +44,28 @@
     "test:conformance": "node --import tsx --test \"test/conformance/**/*.test.ts\"",
     "start": "node dist/src/server.js",
     "start:http": "node dist/src/server-http.js",
-    "start:worker": "node dist/src/worker-main.js"
+    "start:worker": "node dist/src/worker-main.js",
+    "oauth:issue-code": "node dist/src/oauth-cli.js issue-code"
   },
   "dependencies": {
     "@azure/identity": "^4.5.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "ajv": "^8.17.1",
-    "jose": "^6.2.8",
+    "html-to-text": "^10.0.1",
+    "jose": "^6.2.9",
+    "undici": "^6.28.1",
     "yaml": "^2.5.1"
   },
   "devDependencies": {
+    "@types/html-to-text": "^9.0.4",
     "@types/node": "^26.2.0",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2"
   },
   "engines": {
     "node": ">=20"
+  },
+  "optionalDependencies": {
+    "@github/copilot-sdk": "1.0.16"
   }
 }

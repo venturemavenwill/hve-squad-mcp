@@ -1,35 +1,33 @@
+#requires -Version 7.0
+
 <#
 .SYNOPSIS
-  Packs the Cowork plugin into an uploadable .zip.
+  Packs the project-managed Cowork plugin into an uploadable .zip.
 
 .DESCRIPTION
-  Run `npm run generate:cowork` first — it emits tools/hve-squad-tools.json from
-  tools.catalog.yml and validates the package against the Agent Skills rules
-  Cowork enforces at upload. This script only zips what that produced.
-
-  The .zip is written to cowork/build/ and is git-ignored: it carries whatever
-  tenant values you substituted into manifest.json.
+  Run `npm run generate:cowork` first. It validates the v1.29 dynamic MCP
+  contract: one orchestrator-first project I/O Agent Skill, no pinned
+  mcpToolDescription, and one authenticated remoteMcpServer. This script
+  substitutes tenant values and packages the manifest, icons, and skill files.
 #>
 [CmdletBinding()]
 param(
-    # The MCP server host, e.g. "squad.happysea-1234.westeurope.azurecontainerapps.io".
     [string] $Fqdn,
-    # The OAuth client registration id from the Enterprise Token Store.
     [string] $OAuthReferenceId,
     [string] $OutputPath = "$PSScriptRoot/build/hve-squad-cowork.zip"
 )
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+$required = @('manifest.json', 'color.png', 'outline.png')
 
-$required = @('manifest.json', 'color.png', 'outline.png', 'tools', 'skills')
 foreach ($item in $required) {
     if (-not (Test-Path (Join-Path $root $item))) {
         throw "Missing '$item'. Run 'npm run generate:cowork' first."
     }
 }
 
-$staging = Join-Path ([System.IO.Path]::GetTempPath()) "cowork-pack-$([guid]::NewGuid().ToString('N'))"
+$staging = Join-Path $root ".pack-staging-$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $staging -Force | Out-Null
 
 try {
@@ -52,6 +50,66 @@ try {
         Write-Warning "Placeholders left in manifest.json: $($remaining -join ', '). The package will upload but the connector will not authenticate."
     }
 
+    $declared = $manifest | ConvertFrom-Json
+    if ($declared.manifestVersion -ne '1.29') {
+        throw "Dynamic MCP discovery requires manifestVersion 1.29."
+    }
+    if ($null -eq $declared.agentSkills -or @($declared.agentSkills).Count -eq 0) {
+        throw "The Cowork package must declare at least one Agent Skill."
+    }
+    $requiredEntries = @('manifest.json', 'color.png', 'outline.png')
+    foreach ($skill in @($declared.agentSkills)) {
+        $folder = [string]$skill.folder
+        if ($folder -notmatch '^\./skills/[a-z0-9]+(?:-[a-z0-9]+)*$') {
+            throw "Invalid Agent Skill folder '$folder'."
+        }
+        $entry = "$($folder.Substring(2))/SKILL.md"
+        $relativeFolder = $folder.Substring(2).Replace('/', [IO.Path]::DirectorySeparatorChar)
+        $sourceFolder = Join-Path $root $relativeFolder
+        $skillPath = Join-Path $sourceFolder 'SKILL.md'
+        if (-not (Test-Path $skillPath)) {
+            throw "Agent Skill '$folder' is missing SKILL.md."
+        }
+        $skillText = Get-Content $skillPath -Raw
+        if ($skillText.Length -gt 20000) {
+            throw "Agent Skill '$folder'/SKILL.md contains $($skillText.Length) characters; maximum is 20000."
+        }
+        if ($folder -eq './skills/hve-project-manager') {
+            foreach ($reference in @('references/project-contract.md', 'references/execution-protocol.md', 'references/artifact-sync.md', 'references/stakeholder-library.md', 'references/context-preflight.md')) {
+                if (-not (Test-Path (Join-Path $sourceFolder $reference) -PathType Leaf)) {
+                    throw "Agent Skill '$folder' is missing $reference."
+                }
+                $requiredEntries += "$($folder.Substring(2))/$reference"
+            }
+            $requiredContract = @{
+                'orchestrator entry' = '(?m)^\s+orchestrator-entry-tool:\s+squad_run\s*$'
+                'status control' = '(?m)^\s+status-tool:\s+squad_status\s*$'
+                'output retrieval' = '(?m)^\s+output-read-tool:\s+squad_history\s*$'
+                'approval control' = '(?m)^\s+approval-tool:\s+squad_approve\s*$'
+                'human response control' = '(?m)^\s+human-response-tool:\s+squad_respond\s*$'
+                'I/O responsibility' = '(?m)^\s+responsibility:\s+project-io-bridge\s*$'
+                'artifact synchronization' = '(?m)^\s+artifact-sync-protocol:\s+references/artifact-sync\.md\s*$'
+                'canonical artifact layout' = '(?m)^\s+artifact-layout:\s+server-canonical\s*$'
+                'stakeholder library' = '(?m)^\s+stakeholder-library-protocol:\s+references/stakeholder-library\.md\s*$'
+                'context preflight' = '(?m)^\s+context-preflight-protocol:\s+references/context-preflight\.md\s*$'
+            }
+            foreach ($contract in $requiredContract.GetEnumerator()) {
+                if ($skillText -notmatch $contract.Value) {
+                    throw "Agent Skill '$folder' is missing its $($contract.Key) contract."
+                }
+            }
+        }
+        $destinationParent = Split-Path -Parent (Join-Path $staging $relativeFolder)
+        New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
+        Copy-Item -Path $sourceFolder -Destination $destinationParent -Recurse -Force
+        $requiredEntries += $entry
+    }
+    foreach ($connector in @($declared.agentConnectors)) {
+        if ($null -ne $connector.toolSource.remoteMcpServer.mcpToolDescription) {
+            throw "Dynamic MCP discovery requires mcpToolDescription to be omitted."
+        }
+    }
+
     Set-Content -Path $manifestPath -Value $manifest -NoNewline
 
     $outDir = Split-Path -Parent $OutputPath
@@ -60,30 +118,14 @@ try {
 
     Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $OutputPath -Force
 
-    # Verify every manifest-declared path resolves to a real archive entry.
-    # The publish service matches these LITERALLY against zip entry names, so a
-    # path that is valid on disk (for example "./tools/x.json") can still fail at
-    # publish with "not found in the app package". Assert against the built zip.
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $OutputPath))
     try {
         $entries = $zip.Entries | ForEach-Object { $_.FullName }
-        $declared = @($manifest | ConvertFrom-Json)
-        $problems = @()
-
-        $toolsFile = $declared.agentConnectors.toolSource.remoteMcpServer.mcpToolDescription.file
-        foreach ($file in @($toolsFile)) {
-            if ($file -and $entries -notcontains $file) {
-                $problems += "mcpToolDescription.file '$file' is not an entry in the archive."
+        foreach ($item in $requiredEntries) {
+            if ($entries -notcontains $item) {
+                throw "Required archive entry '$item' is missing."
             }
-        }
-        foreach ($folder in @($declared.agentSkills.folder)) {
-            if ($folder -and -not ($entries | Where-Object { $_ -like "$folder/*" })) {
-                $problems += "agentSkills folder '$folder' has no entries in the archive."
-            }
-        }
-        if ($problems) {
-            throw "Packaged zip does not match manifest:`n  - $($problems -join "`n  - ")"
         }
     }
     finally {
@@ -92,7 +134,7 @@ try {
 
     $size = [math]::Round((Get-Item $OutputPath).Length / 1KB, 1)
     Write-Host "Packed $OutputPath ($size KB)."
-    Write-Host "Verified every manifest-declared path resolves to an archive entry."
+    Write-Host "Verified orchestrator-first project I/O skill plus dynamic MCP connector."
     Write-Host "Upload it in Cowork: Customize > Plugins > Upload plugin."
 }
 finally {

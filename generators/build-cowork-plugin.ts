@@ -1,588 +1,392 @@
 /**
- * Copilot Cowork plugin generator (PROD-3).
+ * Validate the Copilot Cowork project-management skill and dynamic MCP connector.
  *
- * Projects the Cowork plugin package from the same authored sources every other
- * surface is built from:
- *
- *   * `tools.catalog.yml` + the synthetic tool descriptors -> the
- *     `mcpToolDescription` file the v1.28 manifest requires.
- *   * `cowork/skills/` -> the Agent Skills the package ships (hand-authored
- *     prose, exactly like `copilot-studio/`; this generator VALIDATES them
- *     rather than writing them).
- *
- * Cowork has no sub-agents (`agents/` is not supported in the M365 manifest), so
- * the parent/child topology of `copilot-studio/` is projected as ONE dispatcher
- * skill plus narrow spoke skills that hand off to each other in prose. That
- * handoff is advisory: Cowork selects skills by description, and nothing here
- * can enforce an order the way a Copilot Studio parent can.
- *
- * The generator refuses to emit a package that would be rejected at upload:
- * every ASKILL-M and ASKILL-P rule documented for Agent Skills packaging is
- * checked here, so a failure surfaces at build time rather than as an HTTP 400.
+ * The Agent Skill owns the stable project I/O workflow. The server remains the
+ * orchestration authority, entered through squad_run, and the source of truth
+ * for its enabled tools through initialize and tools/list.
  */
-import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { basename, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { parse as parseYaml } from "yaml";
 
-import { loadCatalog, type ToolCatalog } from "../src/catalog/catalog.js";
-import { requiredScopeFor } from "../src/auth/scopes.js";
-import { SQUAD_GUIDED_BANNER } from "../src/engine/render-embedded.js";
 import { packageRoot } from "../src/paths.js";
-import { emitOrCheck } from "./emit.js";
 
-const FORBIDDEN_CLAIM = "squad-executed";
-const DELEGATED_PHRASE = "delegated execution";
-
-/** Agent Skills packaging limits (ASKILL-M002, companion-file rules, loading model). */
-const MAX_SKILLS = 20;
+const MANIFEST_VERSION = "1.29";
+const MANIFEST_SCHEMA =
+  "https://developer.microsoft.com/json-schemas/teams/v1.29/MicrosoftTeams.schema.json";
 const MAX_CONNECTORS = 10;
+const MAX_SKILLS = 20;
+const MAX_SKILL_FILE_BYTES = 1024 * 1024;
+const MAX_SKILL_CHARACTERS = 20_000;
 const MAX_COMPANION_FILES = 20;
-const MAX_COMPANION_BYTES = 5 * 1024 * 1024;
-const MAX_TOTAL_COMPANION_BYTES = 10 * 1024 * 1024;
-const MAX_FOLDER_PATH_CHARS = 256;
-const MAX_DESCRIPTION_CHARS = 1024;
-/** The documented target for a skill body; over this the body stops loading reliably. */
-const SKILL_BODY_TOKEN_TARGET = 5000;
-/** Rough chars-per-token used only to warn well before the real limit. */
-const CHARS_PER_TOKEN = 4;
+const MAX_COMPANION_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_COMPANION_TOTAL_BYTES = 10 * 1024 * 1024;
+const REQUIRED_PROJECT_SKILL = "./skills/hve-project-manager";
+const REQUIRED_PROJECT_CONTRACT = "references/project-contract.md";
+const REQUIRED_EXECUTION_PROTOCOL = "references/execution-protocol.md";
+const REQUIRED_ARTIFACT_SYNC_PROTOCOL = "references/artifact-sync.md";
+const REQUIRED_STAKEHOLDER_LIBRARY_PROTOCOL = "references/stakeholder-library.md";
+const REQUIRED_CONTEXT_PREFLIGHT_PROTOCOL = "references/context-preflight.md";
+const REQUIRED_ARTIFACT_LAYOUT = "server-canonical";
+const REQUIRED_ORCHESTRATOR_ENTRY_TOOL = "squad_run";
+const REQUIRED_STATUS_TOOL = "squad_status";
+const REQUIRED_OUTPUT_READ_TOOL = "squad_history";
+const REQUIRED_APPROVAL_TOOL = "squad_approve";
+const REQUIRED_HUMAN_RESPONSE_TOOL = "squad_respond";
+const REQUIRED_PROJECT_RESPONSIBILITY = "project-io-bridge";
+const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const SAFE_FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9 _.!-]*$/;
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 
-const KEBAB = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-
-/** One tool as the `mcpToolDescription` file declares it (MCP `tools/list` shape). */
-export interface CoworkTool {
-  name: string;
-  title: string;
-  description: string;
-  inputSchema: unknown;
-  annotations: { title: string; readOnlyHint?: boolean; destructiveHint?: boolean };
-  /** The OAuth scope the server enforces for this tool (documentation only). */
-  scope: string | undefined;
+interface CoworkAuthorization {
+  type?: string;
+  referenceId?: string;
 }
 
-/**
- * Rewrite the catalog's Phase 0 DELEGATED copy into the embedded claim. The
- * catalog describes the VS Code stdio surface, where the calling host runs the
- * subagent loop; Cowork is a tool caller, so shipping that copy verbatim would
- * tell a user the wrong thing about where execution happens (PROD-2 / MINOR-1).
- */
-const DELEGATED_SENTENCE = /\s*Delegated execution:.*?(?=\s+Use for\b|$)/i;
+interface CoworkRemoteMcpServer {
+  mcpServerUrl?: string;
+  mcpToolDescription?: unknown;
+  authorization?: CoworkAuthorization;
+}
 
-function embeddedSentence(toolId: string): string {
-  if (toolId === "squad_run" || toolId === "squad_federate") {
-    return (
-      ` Embedded execution (${SQUAD_GUIDED_BANNER}): the server runs this server-side under its gates. ` +
-      "Because it is gated, the call returns immediately with a run id and may PAUSE at the Human Gate; " +
-      "poll squad_status with that run id to advance the run after an out-of-band operator approval."
-    );
-  }
-  if (toolId === "squad_review") {
-    return (
-      ` Embedded execution (${SQUAD_GUIDED_BANNER}): the server runs the review stage under the squad's gates ` +
-      "and returns a finished reviewer artifact (a single reviewer pass, not a convened council verdict)."
-    );
-  }
+interface CoworkConnector {
+  id?: string;
+  displayName?: string;
+  description?: string;
+  toolSource?: {
+    remoteMcpServer?: CoworkRemoteMcpServer;
+  };
+}
+
+export interface CoworkSkill {
+  folder?: string;
+}
+
+export interface CoworkManifest {
+  $schema?: string;
+  manifestVersion?: string;
+  version?: string;
+  agentSkills?: CoworkSkill[];
+  agentConnectors?: CoworkConnector[];
+}
+
+function hasOwn(record: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validMcpUrl(value: string): boolean {
   return (
-    ` Embedded execution (${SQUAD_GUIDED_BANNER}): the server runs this squad stage under its gates and ` +
-    "returns the finished artifact."
+    value === "https://<CONTAINER_APP_FQDN>/mcp" ||
+    /^https:\/\/[^<>\s/]+(?::\d+)?\/mcp\/?$/.test(value)
   );
 }
 
-export function toCoworkDescription(toolId: string, description: string): string {
-  const normalized = description.replace(/\s+/g, " ").trim();
-  return normalized.replace(DELEGATED_SENTENCE, embeddedSentence(toolId)).replace(/\s+/g, " ").trim();
-}
-
-/** Text-in / text-out advisory tools carry no impactful action. */
-function advisoryAnnotations(title: string) {
-  return { title, readOnlyHint: true };
-}
-
-/**
- * Annotate a catalog tool. A gated catch-all (`squad_run`, `squad_federate`)
- * allocates durable run state and can pause at the Human Gate, so it is NOT
- * read-only even though it lands no impactful action — claiming otherwise would
- * let it auto-run once annotation-driven confirmation reaches this connector.
- */
-function catalogAnnotations(tool: { title: string; gates: boolean }) {
-  return tool.gates ? { title: tool.title } : advisoryAnnotations(tool.title);
-}
-
-/**
- * The synthetic tools, declared here for the same reason
- * `build-copilot-studio-connector.ts` declares them: they are transport-level
- * utilities, not routing intents, so they are absent from `tools.catalog.yml`.
- *
- * `annotations` drive Cowork's confirmation prompts for non-Microsoft MCP
- * servers. Setting them is forward-compatible: the prompts surface as that
- * rollout expands, with no change here.
- */
-function syntheticTools(): CoworkTool[] {
-  const project = {
-    type: "string",
-    pattern: "^[a-z0-9][a-z0-9-]*$",
-    description: "The project namespace within your tenant (lowercase dns-ish label).",
-  };
-  const target = {
-    type: "string",
-    pattern: "^[a-z0-9][a-z0-9-]{0,63}$",
-    description:
-      "Optional operator-declared storage destination to use. Omit to use the deployment's default.",
-  };
-  return [
-    {
-      name: "squad_status",
-      title: "Squad Status",
-      description:
-        "Poll an async squad run by its run id and return its status; when the run is complete, return " +
-        "the finished squad-guided artifact. A held run stays paused until an operator approves it " +
-        "out-of-band — the squad never auto-releases a gate.",
-      inputSchema: {
-        type: "object",
-        additionalProperties: false,
-        required: ["runId"],
-        properties: {
-          runId: { type: "string", description: "The server-allocated run id returned by squad_run." },
-        },
-      },
-      annotations: advisoryAnnotations("Squad Status"),
-      scope: requiredScopeFor("squad_status"),
-    },
-    {
-      name: "squad_business_plan",
-      title: "Squad Business Plan",
-      description:
-        `Turn an idea, opportunity, or rough brief into a sponsor-readable business plan (${SQUAD_GUIDED_BANNER}) ` +
-        "in exactly ten sections: Summary, Problem and Customer, Proposed Solution, Value and Success " +
-        "Measures, Scope, Go-to-Market, Cost and Effort Outline, Risks and Dependencies, Milestones, and " +
-        "Open Questions. Plans only: it reaches no tracker and writes to no business system. Served only " +
-        "when the operator has enabled the business tools.",
-      inputSchema: {
-        type: "object",
-        additionalProperties: false,
-        required: ["request"],
-        properties: {
-          request: { type: "string", minLength: 1, description: "The opportunity and the sponsor decision." },
-          context: { type: "string", description: "Evidence, customer, constraints, budget envelope." },
-          squad: { type: "string", pattern: "^[a-z0-9][a-z0-9-]*$", description: "Optional sub-squad target." },
-        },
-      },
-      annotations: advisoryAnnotations("Squad Business Plan"),
-      scope: requiredScopeFor("squad_business_plan"),
-    },
-    {
-      name: "squad_backlog",
-      title: "Squad Backlog",
-      description:
-        `Turn approved scope into a structured delivery backlog (${SQUAD_GUIDED_BANNER}) returned as JSON: ` +
-        "epics, user stories with acceptance criteria, and tasks, plus a flattened 'workItems' array with " +
-        "stable 'ref'/'parentRef' ids. Create the items by calling the Azure DevOps or Jira connector once " +
-        "per element of 'workItems', parents first, linking children by 'parentRef'. This tool only plans — " +
-        "it writes nothing to Azure DevOps or Jira. Served only when the operator has enabled the business tools.",
-      inputSchema: {
-        type: "object",
-        additionalProperties: false,
-        required: ["request"],
-        properties: {
-          request: { type: "string", minLength: 1, description: "The outcome to decompose." },
-          context: { type: "string", description: "Approved plan, NFRs, definition of done, exclusions." },
-          squad: { type: "string", pattern: "^[a-z0-9][a-z0-9-]*$", description: "Optional sub-squad target." },
-        },
-      },
-      annotations: advisoryAnnotations("Squad Backlog"),
-      scope: requiredScopeFor("squad_backlog"),
-    },
-    {
-      name: "squad_render_pptx",
-      title: "Squad Render PPTX",
-      description:
-        "Render a PowerPoint deck from content YAML and style YAML and return a short-lived download link " +
-        "to the generated .pptx file. Deterministic: no model call. Creates a stored file as its only side " +
-        "effect. Served only when the operator has enabled rendering.",
-      inputSchema: {
-        type: "object",
-        additionalProperties: false,
-        required: ["contentYaml", "styleYaml"],
-        properties: {
-          contentYaml: {
-            type: "string",
-            description: "A YAML document with a top-level 'slides:' array; each item is one slide.",
-          },
-          styleYaml: { type: "string", description: "The global style.yaml body (dimensions, layouts, defaults)." },
-        },
-      },
-      annotations: { title: "Render PowerPoint Deck" },
-      scope: requiredScopeFor("squad_render_pptx"),
-    },
-    {
-      name: "squad_memory_read",
-      title: "Squad Memory Read",
-      description:
-        "Read one entry of the project's own squad memory and return its content and etag (the etag to pass " +
-        "as expectedEtag on a subsequent write). Deterministic: no model call, no impactful action.",
-      inputSchema: {
-        type: "object",
-        additionalProperties: false,
-        required: ["project", "path"],
-        properties: {
-          project,
-          path: { type: "string", description: "The logical memory path (e.g. 'state', 'decisions')." },
-          target,
-        },
-      },
-      annotations: advisoryAnnotations("Squad Memory Read"),
-      scope: requiredScopeFor("squad_memory_read"),
-    },
-    {
-      name: "squad_memory_write",
-      title: "Squad Memory Write",
-      description:
-        "Write (create or replace) one entry of the project's own squad memory under compare-and-swap and " +
-        "return the new etag. Pass the prior etag as expectedEtag to guard against clobbering a concurrent " +
-        "writer; omit it for a first write. Deterministic: no model call.",
-      inputSchema: {
-        type: "object",
-        additionalProperties: false,
-        required: ["project", "path", "content"],
-        properties: {
-          project,
-          path: { type: "string", description: "The logical memory path (e.g. 'state', 'decisions')." },
-          content: { type: "string", description: "The full new content to persist at 'path'." },
-          expectedEtag: { type: "string", description: "The etag from the prior read; the write applies only if it matches." },
-          target,
-        },
-      },
-      annotations: { title: "Squad Memory Write", destructiveHint: true },
-      scope: requiredScopeFor("squad_memory_write"),
-    },
-    {
-      name: "squad_memory_sync",
-      title: "Squad Memory Sync",
-      description:
-        "Flush a batch of the project's own squad-memory entries in one call. Each item is written under its " +
-        "own compare-and-swap; a stale expectedEtag on one item is reported as a conflict in the results " +
-        "without aborting the others. Returns a per-item result array. Deterministic: no model call.",
-      inputSchema: {
-        type: "object",
-        additionalProperties: false,
-        required: ["project", "items"],
-        properties: {
-          project,
-          items: {
-            type: "array",
-            description: "The entries to flush; each is applied under its own compare-and-swap.",
-            items: {
-              type: "object",
-              additionalProperties: false,
-              required: ["path", "content"],
-              properties: {
-                path: { type: "string", description: "The logical memory path." },
-                content: { type: "string", description: "The full new content for this entry." },
-                expectedEtag: { type: "string", description: "The etag from the prior read of this entry." },
-              },
-            },
-          },
-          target,
-        },
-      },
-      annotations: { title: "Squad Memory Sync", destructiveHint: true },
-      scope: requiredScopeFor("squad_memory_sync"),
-    },
-    {
-      name: "squad_history",
-      title: "Squad History",
-      description:
-        "Browse and open what previous squad runs produced for a project: the squad state, each role's " +
-        "deliverables, and the per-agent history. Use op='index' for a compact picture of what exists, " +
-        "op='list' to enumerate a directory, and op='read' to open one artifact. Deterministic: no model " +
-        "call. Served only when the operator has enabled the squad ledger.",
-      inputSchema: {
-        type: "object",
-        additionalProperties: false,
-        required: ["project"],
-        properties: {
-          project,
-          op: {
-            type: "string",
-            enum: ["index", "list", "read"],
-            description: "index (default) summarizes; list enumerates a prefix; read opens one path.",
-          },
-          prefix: { type: "string", description: "For op='list': a directory such as '.copilot-tracking/plans'." },
-          path: { type: "string", description: "For op='read': the artifact path from a list result." },
-        },
-      },
-      annotations: advisoryAnnotations("Squad History"),
-      scope: requiredScopeFor("squad_history"),
-    },
-  ];
-}
-
-/** The `mcpToolDescription` payload: every tool the Cowork connector can reach. */
-export function buildToolDescription(catalog: ToolCatalog): {
-  name: string;
-  fidelityClaim: string;
-  generatedBy: string;
-  source: string;
-  tools: CoworkTool[];
-} {
-  const tools: CoworkTool[] = catalog.tools.map((tool) => ({
-    name: tool.id,
-    title: tool.title,
-    description: toCoworkDescription(tool.id, tool.description),
-    inputSchema: tool.input,
-    annotations: catalogAnnotations(tool),
-    scope: requiredScopeFor(tool.id),
-  }));
-  tools.push(...syntheticTools());
-
-  const payload = {
-    name: "hve-squad",
-    fidelityClaim: SQUAD_GUIDED_BANNER,
-    generatedBy: "generators/build-cowork-plugin.ts",
-    source: "tools.catalog.yml",
-    tools,
-  };
-
-  // PROD-2: never ship copy that claims execution rather than guidance.
-  const blob = JSON.stringify(payload).toLowerCase();
-  if (blob.includes(FORBIDDEN_CLAIM)) {
-    throw new Error(`Cowork copy must not contain the forbidden claim "${FORBIDDEN_CLAIM}" (PROD-2).`);
+function validSkillFolder(folder: string): boolean {
+  if (folder.length > 256 || !folder.startsWith("./skills/")) {
+    return false;
   }
-  for (const tool of payload.tools) {
-    if (tool.description.toLowerCase().includes(DELEGATED_PHRASE)) {
-      throw new Error(
-        `Tool "${tool.name}" still carries delegated-execution copy; Cowork is a tool caller (PROD-2).`,
-      );
-    }
-  }
-  return payload;
+  const name = folder.slice("./skills/".length);
+  return name.length <= 64 && SKILL_NAME.test(name);
 }
 
-interface SkillFrontmatter {
-  name: string;
-  description: string;
-}
-
-/**
- * Parse a skill's YAML frontmatter.
- *
- * Uses the real YAML parser rather than a regex: the Cowork docs recommend a
- * block scalar (`description: |`) for the description, and a hand-rolled matcher
- * silently captured the `|` itself — which made the length check pass on a
- * one-character string and validate nothing.
- */
-function parseFrontmatter(source: string): SkillFrontmatter | undefined {
-  const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(source);
-  if (!match) {
-    return undefined;
-  }
-  let parsed: unknown;
-  try {
-    parsed = parseYaml(match[1]);
-  } catch {
-    return undefined;
-  }
-  if (typeof parsed !== "object" || parsed === null) {
-    return undefined;
-  }
-  const record = parsed as Record<string, unknown>;
-  const name = typeof record.name === "string" ? record.name.trim() : "";
-  const description = typeof record.description === "string" ? record.description.trim() : "";
-  if (name.length === 0 || description.length === 0) {
-    return undefined;
-  }
-  return { name, description };
-}
-
-function walk(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const full = join(dir, entry.name);
+function collectFiles(directory: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
     if (entry.isDirectory()) {
-      out.push(...walk(full));
-    } else {
-      out.push(full);
+      files.push(...collectFiles(path));
+    } else if (entry.isFile()) {
+      files.push(path);
     }
   }
-  return out;
+  return files;
 }
 
-/**
- * Validate the authored skills against the packaging rules Cowork enforces at
- * upload. Returns the problems found; an empty list means the package is
- * uploadable as far as these rules can tell.
- */
-export function validateSkills(coworkRoot: string, skillFolders: string[]): string[] {
+/** Validate the manifest contract Cowork consumes at runtime. */
+export function validateManifest(manifest: CoworkManifest): string[] {
   const problems: string[] = [];
 
-  if (skillFolders.length > MAX_SKILLS) {
-    problems.push(`ASKILL-M002: ${skillFolders.length} skills exceeds the limit of ${MAX_SKILLS}.`);
+  if (manifest.manifestVersion !== MANIFEST_VERSION) {
+    problems.push(
+      `Dynamic agent-connector discovery requires manifestVersion ${MANIFEST_VERSION}; ` +
+        `found ${manifest.manifestVersion ?? "(missing)"}.`,
+    );
+  }
+  if (manifest.$schema !== MANIFEST_SCHEMA) {
+    problems.push(`$schema must target the Teams ${MANIFEST_VERSION} schema.`);
   }
 
-  for (const folder of skillFolders) {
-    if (folder.length > MAX_FOLDER_PATH_CHARS) {
-      problems.push(`ASKILL-M003: folder path exceeds ${MAX_FOLDER_PATH_CHARS} characters: ${folder}`);
-    }
-    const abs = join(coworkRoot, folder);
-    if (!existsSync(abs)) {
-      problems.push(`ASKILL-P001: folder referenced in manifest is missing from the package: ${folder}`);
-      continue;
-    }
-    const skillFile = join(abs, "SKILL.md");
-    if (!existsSync(skillFile)) {
-      problems.push(`ASKILL-P002: no SKILL.md in ${folder}`);
-      continue;
-    }
-    const source = readFileSync(skillFile, "utf8");
-    const front = parseFrontmatter(source);
-    if (!front) {
-      problems.push(`ASKILL-P003/P004/P005: ${folder}/SKILL.md needs valid frontmatter with name and description.`);
-      continue;
-    }
-    const expected = folder.split("/").pop() ?? "";
-    if (front.name !== expected) {
-      problems.push(`ASKILL-P006: ${folder}/SKILL.md declares name "${front.name}" but the folder is "${expected}".`);
-    }
-    if (!KEBAB.test(front.name)) {
-      problems.push(`Naming: "${front.name}" is not kebab-case (lowercase alphanumerics and single hyphens).`);
-    }
-    if (front.description.length < 1 || front.description.length > MAX_DESCRIPTION_CHARS) {
-      problems.push(
-        `Description: ${folder} is ${front.description.length} chars; the limit is ${MAX_DESCRIPTION_CHARS}. ` +
-          "Over the limit the skill never loads.",
-      );
-    }
-    const body = source.slice(source.indexOf("---", 3) + 3);
-    const approxTokens = Math.round(body.length / CHARS_PER_TOKEN);
-    if (approxTokens > SKILL_BODY_TOKEN_TARGET) {
-      problems.push(
-        `Body size: ${folder}/SKILL.md is ~${approxTokens} tokens, over the ${SKILL_BODY_TOKEN_TARGET}-token ` +
-          "target. Move detail into references/.",
-      );
-    }
-
-    const companions = walk(abs).filter((file) => file !== skillFile);
-    if (companions.length > MAX_COMPANION_FILES) {
-      problems.push(`Companions: ${folder} has ${companions.length} companion files; the limit is ${MAX_COMPANION_FILES}.`);
-    }
-    let total = 0;
-    for (const file of companions) {
-      const size = statSync(file).size;
-      total += size;
-      const rel = relative(abs, file).replace(/\\/g, "/");
-      if (size > MAX_COMPANION_BYTES) {
-        problems.push(`Companions: ${folder}/${rel} is larger than 5 MB.`);
-      }
-      if (rel.includes("..") || rel.startsWith("/") || rel.split("/").some((part) => part.startsWith("."))) {
-        problems.push(`Companions: ${folder}/${rel} uses a hidden segment or path traversal.`);
-      }
-    }
-    if (total > MAX_TOTAL_COMPANION_BYTES) {
-      problems.push(`Companions: ${folder} companions total ${total} bytes, over the 10 MB limit.`);
-    }
+  const skills = Array.isArray(manifest.agentSkills) ? manifest.agentSkills : [];
+  if (manifest.agentSkills !== undefined && !Array.isArray(manifest.agentSkills)) {
+    problems.push("agentSkills must be an array.");
   }
-  return problems;
-}
-
-interface CoworkManifest {
-  agentSkills?: { folder: string }[];
-  agentConnectors?: {
-    toolSource?: { remoteMcpServer?: { mcpToolDescription?: { file?: string } } };
-  }[];
-}
-
-/**
- * Validate the manifest's own constraints and its references into the package.
- *
- * Paths are checked as ARCHIVE ENTRY NAMES, not just as filesystem paths. The
- * packaging service resolves `mcpToolDescription.file` and each skill `folder`
- * by literal lookup against the zip's entry names, which carry no `./` prefix
- * and no backslashes. A `./tools/x.json` that resolves perfectly well on disk is
- * therefore reported at publish time as "not found in the app package" — so a
- * path that would not match an entry is an error here, not a style preference.
- */
-export function validateManifest(coworkRoot: string, manifest: CoworkManifest): string[] {
-  const problems: string[] = [];
-
-  /** Reject any path shape a zip entry name can never take. */
-  const checkEntryPath = (value: string, field: string): void => {
-    if (value.startsWith("./") || value.startsWith("../")) {
+  if (skills.length === 0) {
+    problems.push("At least one agentSkill is required.");
+  }
+  if (skills.length > MAX_SKILLS) {
+    problems.push(`Agent Skills: ${skills.length} exceeds the limit of ${MAX_SKILLS}.`);
+  }
+  const skillFolders = new Set<string>();
+  for (const skill of skills) {
+    const folder = skill.folder?.trim() ?? "";
+    if (!validSkillFolder(folder)) {
       problems.push(
-        `${field} is "${value}"; the package service matches archive entry names literally and those ` +
-          `carry no "./" prefix. Use "${value.replace(/^\.\.?\//, "")}".`,
+        `Agent Skill folder must be ./skills/<lower-kebab-name>; found ${folder || "(missing)"}.`,
       );
-    }
-    if (value.includes("\\")) {
-      problems.push(`${field} is "${value}"; archive entry names use forward slashes only.`);
-    }
-    if (value.startsWith("/")) {
-      problems.push(`${field} is "${value}"; the path must be relative to the package root.`);
-    }
-  };
-
-  const skills = manifest.agentSkills ?? [];
-  for (const entry of skills) {
-    if (!entry.folder) {
-      problems.push("ASKILL-M001: every agentSkills entry needs a 'folder'.");
       continue;
     }
-    checkEntryPath(entry.folder, `agentSkills folder`);
+    if (skillFolders.has(folder)) {
+      problems.push(`Duplicate Agent Skill folder: ${folder}.`);
+    }
+    skillFolders.add(folder);
   }
+  if (!skillFolders.has(REQUIRED_PROJECT_SKILL)) {
+    problems.push(`The package must declare ${REQUIRED_PROJECT_SKILL}.`);
+  }
+
   const connectors = manifest.agentConnectors ?? [];
+  if (connectors.length === 0) {
+    problems.push("At least one agentConnector is required.");
+  }
   if (connectors.length > MAX_CONNECTORS) {
     problems.push(`Connectors: ${connectors.length} exceeds the limit of ${MAX_CONNECTORS}.`);
   }
+
+  const ids = new Set<string>();
   for (const connector of connectors) {
-    const file = connector.toolSource?.remoteMcpServer?.mcpToolDescription?.file;
-    if (!file) {
-      problems.push(
-        "mcpToolDescription is required on every remoteMcpServer connector; without it the upload " +
-          "fails with HTTP 400.",
-      );
+    const id = connector.id?.trim() ?? "";
+    if (id.length === 0) {
+      problems.push("Every agentConnector needs a non-empty id.");
+    } else if (ids.has(id)) {
+      problems.push(`Duplicate agentConnector id: ${id}.`);
+    } else {
+      ids.add(id);
+    }
+    if (!connector.displayName?.trim()) {
+      problems.push(`Connector ${id || "(unnamed)"} needs a displayName.`);
+    }
+    if (!connector.description?.trim()) {
+      problems.push(`Connector ${id || "(unnamed)"} needs a description for orchestration.`);
+    }
+
+    const remote = connector.toolSource?.remoteMcpServer;
+    if (!remote) {
+      problems.push(`Connector ${id || "(unnamed)"} needs toolSource.remoteMcpServer.`);
       continue;
     }
-    checkEntryPath(file, "mcpToolDescription.file");
-    if (!existsSync(join(coworkRoot, file))) {
-      problems.push(`mcpToolDescription.file points at ${file}, which is not in the package.`);
+    if (hasOwn(remote, "mcpToolDescription")) {
+      problems.push(
+        `Connector ${id || "(unnamed)"} must omit mcpToolDescription so Cowork calls tools/list dynamically.`,
+      );
+    }
+    const serverUrl = remote.mcpServerUrl?.trim() ?? "";
+    if (!validMcpUrl(serverUrl)) {
+      problems.push(
+        `Connector ${id || "(unnamed)"} needs an HTTPS /mcp URL; found ${serverUrl || "(missing)"}.`,
+      );
+    }
+    if (remote.authorization?.type !== "OAuthPluginVault") {
+      problems.push(`Connector ${id || "(unnamed)"} must use OAuthPluginVault for the Entra-secured server.`);
+    }
+    if (!remote.authorization?.referenceId?.trim()) {
+      problems.push(`Connector ${id || "(unnamed)"} needs an OAuthPluginVault referenceId.`);
     }
   }
+
   return problems;
 }
 
-/** Stable content hash, so a rebuild that changed nothing is visible as such. */
-function digest(text: string): string {
-  return createHash("sha256").update(text.replace(/\r\n/g, "\n")).digest("hex").slice(0, 12);
+/** Validate every packaged SKILL.md and its bounded companion files. */
+export function validateSkillPackage(
+  coworkRoot: string,
+  manifest: CoworkManifest,
+): string[] {
+  const problems: string[] = [];
+  const resolvedRoot = resolve(coworkRoot);
+
+  for (const skill of manifest.agentSkills ?? []) {
+    const folder = skill.folder?.trim() ?? "";
+    if (!validSkillFolder(folder)) {
+      continue;
+    }
+
+    const skillDirectory = resolve(resolvedRoot, folder.slice(2));
+    if (!skillDirectory.startsWith(`${resolvedRoot}${sep}`)) {
+      problems.push(`Agent Skill folder escapes the package root: ${folder}.`);
+      continue;
+    }
+
+    const skillPath = join(skillDirectory, "SKILL.md");
+    if (!existsSync(skillPath)) {
+      problems.push(`Agent Skill ${folder} is missing SKILL.md.`);
+      continue;
+    }
+    if (statSync(skillPath).size > MAX_SKILL_FILE_BYTES) {
+      problems.push(`Agent Skill ${folder}/SKILL.md exceeds 1 MB.`);
+    }
+
+    const text = readFileSync(skillPath, "utf8");
+    if (text.length > MAX_SKILL_CHARACTERS) {
+      problems.push(
+        `Agent Skill ${folder}/SKILL.md contains ${text.length} characters; maximum is ${MAX_SKILL_CHARACTERS}.`,
+      );
+    }
+    const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+    if (!frontmatter) {
+      problems.push(`Agent Skill ${folder}/SKILL.md has no YAML frontmatter.`);
+      continue;
+    }
+
+    let metadata: unknown;
+    try {
+      metadata = parseYaml(frontmatter[1]);
+    } catch {
+      problems.push(`Agent Skill ${folder}/SKILL.md has invalid YAML frontmatter.`);
+      continue;
+    }
+    if (!isRecord(metadata)) {
+      problems.push(`Agent Skill ${folder}/SKILL.md frontmatter must be an object.`);
+      continue;
+    }
+
+    const name = typeof metadata.name === "string" ? metadata.name.trim() : "";
+    const description =
+      typeof metadata.description === "string" ? metadata.description.trim() : "";
+    const expectedName = basename(skillDirectory);
+    if (name !== expectedName) {
+      problems.push(
+        `Agent Skill ${folder} name must match its folder (${expectedName}); found ${name || "(missing)"}.`,
+      );
+    }
+    if (description.length === 0 || description.length > 1024) {
+      problems.push(`Agent Skill ${folder} description must contain 1-1024 characters.`);
+    }
+    if (text.slice(frontmatter[0].length).trim().length === 0) {
+      problems.push(`Agent Skill ${folder}/SKILL.md needs an instruction body.`);
+    }
+    if (folder === REQUIRED_PROJECT_SKILL) {
+      for (const reference of [
+        REQUIRED_PROJECT_CONTRACT,
+        REQUIRED_EXECUTION_PROTOCOL,
+        REQUIRED_ARTIFACT_SYNC_PROTOCOL,
+        REQUIRED_STAKEHOLDER_LIBRARY_PROTOCOL,
+        REQUIRED_CONTEXT_PREFLIGHT_PROTOCOL,
+      ]) {
+        if (!existsSync(join(skillDirectory, ...reference.split("/")))) {
+          problems.push(`Agent Skill ${folder} is missing ${reference}.`);
+        }
+      }
+
+      const behavior = isRecord(metadata.metadata) ? metadata.metadata : {};
+      if (behavior["context-preflight-protocol"] !== REQUIRED_CONTEXT_PREFLIGHT_PROTOCOL) {
+        problems.push(
+          `Agent Skill ${folder} must declare metadata.context-preflight-protocol=${REQUIRED_CONTEXT_PREFLIGHT_PROTOCOL}.`,
+        );
+      }
+      if (behavior["stakeholder-library-protocol"] !== REQUIRED_STAKEHOLDER_LIBRARY_PROTOCOL) {
+        problems.push(
+          `Agent Skill ${folder} must declare metadata.stakeholder-library-protocol=${REQUIRED_STAKEHOLDER_LIBRARY_PROTOCOL}.`,
+        );
+      }
+      if (behavior["artifact-sync-protocol"] !== REQUIRED_ARTIFACT_SYNC_PROTOCOL) {
+        problems.push(
+          `Agent Skill ${folder} must declare metadata.artifact-sync-protocol=${REQUIRED_ARTIFACT_SYNC_PROTOCOL}.`,
+        );
+      }
+      if (behavior["artifact-layout"] !== REQUIRED_ARTIFACT_LAYOUT) {
+        problems.push(
+          `Agent Skill ${folder} must declare metadata.artifact-layout=${REQUIRED_ARTIFACT_LAYOUT}.`,
+        );
+      }
+      if (behavior["orchestrator-entry-tool"] !== REQUIRED_ORCHESTRATOR_ENTRY_TOOL) {
+        problems.push(
+          `Agent Skill ${folder} must declare metadata.orchestrator-entry-tool=${REQUIRED_ORCHESTRATOR_ENTRY_TOOL}.`,
+        );
+      }
+      if (behavior["status-tool"] !== REQUIRED_STATUS_TOOL) {
+        problems.push(
+          `Agent Skill ${folder} must declare metadata.status-tool=${REQUIRED_STATUS_TOOL}.`,
+        );
+      }
+      if (behavior["output-read-tool"] !== REQUIRED_OUTPUT_READ_TOOL) {
+        problems.push(
+          `Agent Skill ${folder} must declare metadata.output-read-tool=${REQUIRED_OUTPUT_READ_TOOL}.`,
+        );
+      }
+      if (behavior["approval-tool"] !== REQUIRED_APPROVAL_TOOL) {
+        problems.push(
+          `Agent Skill ${folder} must declare metadata.approval-tool=${REQUIRED_APPROVAL_TOOL}.`,
+        );
+      }
+      if (behavior["human-response-tool"] !== REQUIRED_HUMAN_RESPONSE_TOOL) {
+        problems.push(
+          `Agent Skill ${folder} must declare metadata.human-response-tool=${REQUIRED_HUMAN_RESPONSE_TOOL}.`,
+        );
+      }
+      if (behavior.responsibility !== REQUIRED_PROJECT_RESPONSIBILITY) {
+        problems.push(
+          `Agent Skill ${folder} must declare metadata.responsibility=${REQUIRED_PROJECT_RESPONSIBILITY}.`,
+        );
+      }
+    }
+
+    const companionFiles = collectFiles(skillDirectory).filter(
+      (path) => resolve(path) !== resolve(skillPath),
+    );
+    if (companionFiles.length > MAX_COMPANION_FILES) {
+      problems.push(
+        `Agent Skill ${folder} has ${companionFiles.length} companion files; maximum is ${MAX_COMPANION_FILES}.`,
+      );
+    }
+
+    let companionBytes = 0;
+    for (const file of companionFiles) {
+      const packagePath = relative(skillDirectory, file).replaceAll("\\", "/");
+      const parts = packagePath.split("/");
+      if (
+        parts.some(
+          (part) =>
+            part.startsWith(".") ||
+            !SAFE_FILE_NAME.test(part) ||
+            WINDOWS_RESERVED_NAME.test(part),
+        )
+      ) {
+        problems.push(`Agent Skill ${folder} has an unsafe companion path: ${packagePath}.`);
+      }
+      const size = statSync(file).size;
+      companionBytes += size;
+      if (size > MAX_COMPANION_FILE_BYTES) {
+        problems.push(`Agent Skill companion ${folder}/${packagePath} exceeds 5 MB.`);
+      }
+    }
+    if (companionBytes > MAX_COMPANION_TOTAL_BYTES) {
+      problems.push(`Agent Skill ${folder} companion files exceed 10 MB in total.`);
+    }
+  }
+
+  return problems;
 }
 
 export async function main(argv: readonly string[]): Promise<number> {
   const check = argv.includes("--check");
   const root = packageRoot();
   const coworkRoot = join(root, "cowork");
-  const catalog = loadCatalog(join(root, "tools.catalog.yml"));
-
-  const payload = buildToolDescription(catalog);
-  const toolsPath = join(coworkRoot, "tools", "hve-squad-tools.json");
-  const toolsJson = `${JSON.stringify(payload, null, 2)}\n`;
-
-  const stale = emitOrCheck(new Map([[toolsPath, toolsJson]]), check, root);
-  if (check && stale.length > 0) {
-    console.error(`Stale Cowork outputs (run \`npm run generate:cowork\`):\n  ${stale.join("\n  ")}`);
-    return 1;
-  }
-
   const manifestPath = join(coworkRoot, "manifest.json");
   if (!existsSync(manifestPath)) {
     console.error(`Missing ${relative(root, manifestPath)}.`);
     return 1;
   }
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as CoworkManifest;
-  const folders = (manifest.agentSkills ?? []).map((entry) => entry.folder);
 
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as CoworkManifest;
   const problems = [
-    ...validateManifest(coworkRoot, manifest),
-    ...validateSkills(coworkRoot, folders),
+    ...validateManifest(manifest),
+    ...validateSkillPackage(coworkRoot, manifest),
   ];
   if (problems.length > 0) {
     console.error(`Cowork package validation failed:\n  - ${problems.join("\n  - ")}`);
@@ -590,9 +394,9 @@ export async function main(argv: readonly string[]): Promise<number> {
   }
 
   console.log(
-    `Cowork package OK: ${folders.length} skill(s), ` +
-      `${(manifest.agentConnectors ?? []).length} connector(s), ` +
-      `${payload.tools.length} tool(s) described (tools digest ${digest(toolsJson)}).`,
+    `Cowork project package OK: ${(manifest.agentSkills ?? []).length} skill(s), ` +
+      `${(manifest.agentConnectors ?? []).length} connector(s); orchestrator=${REQUIRED_ORCHESTRATOR_ENTRY_TOOL}, ` +
+      "tools resolve at runtime through initialize + tools/list.",
   );
   if (check) {
     console.log("Check mode: no files written.");

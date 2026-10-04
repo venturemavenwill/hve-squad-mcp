@@ -5,8 +5,15 @@ using './main.bicep'
 
 param containerImage = '<REGISTRY>.azurecr.io/hve-squad-mcp:latest'
 param containerRegistryServer = '<REGISTRY>.azurecr.io'
+
+// MISE production: authClientId is the single protected-resource app id used by
+// ACA, the application, and MISE. Use its tenant-specific issuer and tenant.
+// Venture testing belongs in a separate deployment with enableMise=false, where
+// squad.audience supplies the test resource audience.
 param authClientId = '<ENTRA_CLIENT_ID>'
 param authOpenIdIssuer = 'https://login.microsoftonline.com/<ENTRA_TENANT_ID>/v2.0'
+param enableMise = false
+param miseContainerImage = '<REGISTRY>.azurecr.io/mise/mise-1p-container@sha256:<MISE_IMAGE_DIGEST>'
 
 param squad = {
   audience: 'api://<ENTRA_CLIENT_ID>'
@@ -16,13 +23,16 @@ param squad = {
   jwksUri: 'https://login.microsoftonline.com/<ENTRA_TENANT_ID>/discovery/v2.0/keys'
   modelEndpoint: 'https://<AOAI_RESOURCE>.openai.azure.com'
   allowedModelEndpoints: 'https://<AOAI_RESOURCE>.openai.azure.com'
-  modelDeployment: '<AOAI_DEPLOYMENT>'
+  modelDeployment: 'gpt-5.6-sol'
+  modelApi: 'responses'
   modelApiVersion: '2024-10-21'
+  modelMaxOutputTokens: 32768
+  modelReasoningEffort: 'medium'
+  modelVerbosity: 'medium'
   tenantConcurrency: 4
   tenantCostCeilingUsd: 500
 }
 
-param minReplicas = 0
 param maxReplicas = 5
 param budgetAmountUsd = 500
 param budgetStartDate = '2026-07-01'
@@ -61,3 +71,21 @@ param memoryDefaultProject = 'default'
 
 // The business-facing tools (squad_business_plan, squad_backlog).
 param enableBusinessTools = false
+
+// Zero-configuration MCP OAuth. When enabled, generate a 32-byte key with:
+//   [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+// Operators issue single-use browser codes from inside the running container with
+// `node dist/src/oauth-cli.js issue-code`; there is no remote code-issuance route.
+param enableSimpleOAuth = false
+param simpleOAuthSigningKeysBase64 = ''
+
+// Run agentic stages on GitHub Copilot in a sandbox sidecar (testing; see
+// host/RUNBOOK.md "Optional: run agentic stages on GitHub Copilot"). Requires
+// enableMemory, enableMemoryAuto and enableArtifacts. Store the GitHub token in
+// Key Vault yourself (`az keyvault secret set --name copilot-github-token`);
+// copilotGitHubToken is an alternative that writes it during deployment.
+param enableCopilotSandbox = false
+param copilotSandboxImage = '<REGISTRY>.azurecr.io/hve-squad-copilot-sandbox:<TAG>'
+param copilotModel = ''
+param copilotSubagents = true
+param copilotAllowedHosts = ''
