@@ -20,8 +20,10 @@ metadata:
 
 Owns two tools: `squad_run` to start a governed run and `squad_status` to follow
 one. `squad_run` routes to the **Squad Coordinator** role. Over this connection
-its stages are research, plan, optional council, review, and backlog handoff. It
-lands no impactful action.
+its stages are research, plan, optional council, a bounded text-only developer
+report (or deliverable-specialist fan-out), review, and backlog handoff. The
+single report cannot execute commands, access the network, delegate, or edit
+code. The run lands no impactful action.
 
 ## Choose it deliberately
 

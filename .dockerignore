@@ -11,3 +11,5 @@ copilot-studio
 docs
 test
 *.log
+.cowork-worker-diagnostics*/
+host/infra/*.local.bicepparam

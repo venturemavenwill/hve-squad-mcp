@@ -459,6 +459,7 @@ var copilotSidecar = enableCopilotSandbox
         }
         env: [
           { name: 'COPILOT_CONNECTION_TOKEN', secretRef: copilotConnectionSecretName }
+          { name: 'COPILOT_BROWSER_ALLOWED_HOSTS', value: copilotAllowedHosts }
         ]
         probes: [
           {
