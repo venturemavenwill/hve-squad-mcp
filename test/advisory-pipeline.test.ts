@@ -20,6 +20,7 @@ import type { RoutePlan } from "../src/engine/routing.js";
 import { RunCostLedger } from "../src/engine/gates.js";
 import { UNTRUSTED_OPEN, UNTRUSTED_CLOSE } from "../src/engine/embedded-prompt.js";
 import { ModelBackendError, type BackendRequest, type BackendResult, type ModelBackend } from "../src/engine/model-backend.js";
+import { StageBlockedError } from "../src/engine/research-runtime.js";
 
 /** A backend that returns a canned artifact chosen by a marker in the stage charter. */
 class ScriptedBackend implements ModelBackend {
@@ -395,6 +396,51 @@ test("the advisory runner forwards a report-only stage's execution mode to its e
   );
   assert.equal(result.outcome, "completed");
   assert.equal(receivedMode, "text-only-report");
+});
+
+test("a backlog handoff that declines leaves the reviewed run completed; other blocks still halt", async () => {
+  const plan = [
+    personaStage("Squad Researcher", "RESEARCH"),
+    personaStage("Squad Reviewer", "REVIEW"),
+    personaStage("Functional Planner", "BACKLOG", true),
+  ];
+  const executor = (reason: string) => ({
+    async execute(persona: PersonaRecord) {
+      if (persona.role === "Functional Planner") throw new StageBlockedError(reason, "No PRD or tracker to plan for a research question.");
+      return { text: `${persona.role} output`, backendId: "test", finishReason: "stop" };
+    },
+  });
+  const recorded: string[] = [];
+  const declined = await runAdvisoryPipeline(
+    { toolId: "squad_run", request: "Research HTTP 429 support." },
+    { backend: new ScriptedBackend([]), stageExecutor: executor("stage_blocked"), persistence: {
+      async recordStage(stage) { recorded.push(stage.role); },
+      async recordVerdict() {},
+    } },
+    { plan, mode: "autopilot" },
+  );
+  assert.equal(declined.outcome, "completed");
+  assert.match(declined.artifact, /## Squad Reviewer\n\nSquad Reviewer output/);
+  assert.match(declined.artifact, /## Functional Planner - skipped\n\nNo PRD or tracker/);
+  assert.deepEqual(recorded, ["Squad Researcher", "Squad Reviewer", "Functional Planner"]);
+
+  const limited = await runAdvisoryPipeline(
+    { toolId: "squad_run", request: "Research HTTP 429 support." },
+    { backend: new ScriptedBackend([]), stageExecutor: executor("stage_execution_limit") },
+    { plan, mode: "autopilot" },
+  );
+  assert.equal(limited.outcome, "halted");
+  assert.equal(limited.reason, "stage_execution_limit");
+
+  const reviewBlocked = await runAdvisoryPipeline(
+    { toolId: "squad_run", request: "Research HTTP 429 support." },
+    { backend: new ScriptedBackend([]), stageExecutor: { async execute(persona: PersonaRecord) {
+      if (persona.role === "Squad Reviewer") throw new StageBlockedError("stage_blocked", "Cannot review.");
+      return { text: "ok", backendId: "test", finishReason: "stop" };
+    } } },
+    { plan, mode: "autopilot" },
+  );
+  assert.equal(reviewBlocked.outcome, "halted", "Only the optional backlog handoff may decline without halting.");
 });
 
 test("planAdvisoryStages keeps a research-only route to a single research stage", () => {

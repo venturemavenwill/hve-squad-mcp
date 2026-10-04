@@ -409,6 +409,9 @@ export class CopilotStageExecutor implements AdvisoryStageExecutor {
           `The Copilot session did not resolve a signed-in GitHub identity (${auth.statusMessage ?? "not authenticated"}).`);
       }
     }
+    const maxModelCalls = reportOnly
+      ? Math.min(this.options.maxModelCalls ?? DEFAULT_MAX_MODEL_CALLS, TEXT_ONLY_REPORT_LIMITS.modelCalls)
+      : this.options.maxModelCalls ?? DEFAULT_MAX_MODEL_CALLS;
     const unsubscribe = session.on((event) => {
       if (this.options.onSessionEvent) {
         const toolName = text(record(event.data).toolName) || undefined;
@@ -434,9 +437,6 @@ export class CopilotStageExecutor implements AdvisoryStageExecutor {
           usage: callUsage,
         }, { runId: this.options.runId, stage: persona.role, actor }))));
       }
-      const maxModelCalls = reportOnly
-        ? Math.min(this.options.maxModelCalls ?? DEFAULT_MAX_MODEL_CALLS, TEXT_ONLY_REPORT_LIMITS.modelCalls)
-        : this.options.maxModelCalls ?? DEFAULT_MAX_MODEL_CALLS;
       if (modelCalls >= maxModelCalls && !budgetExceeded) {
         budgetExceeded = true;
         void bounded(() => session.abort());
@@ -490,7 +490,7 @@ export class CopilotStageExecutor implements AdvisoryStageExecutor {
     if (timedOut) throw new StageBlockedError("stage_deadline", `The Copilot stage exceeded its ${deadlineMs} ms deadline.`);
     if (budgetExceeded && state.completion?.status !== "complete") {
       throw new StageBlockedError("stage_execution_limit",
-        `The Copilot stage reached its ${this.options.maxModelCalls ?? DEFAULT_MAX_MODEL_CALLS}-call model budget without completing.`);
+        `The Copilot stage reached its ${maxModelCalls}-call model budget without completing.`);
     }
     if (state.completion?.status === "blocked") throw new StageBlockedError("stage_blocked", state.completion.summary);
     if (state.completion?.status !== "complete") {
@@ -655,7 +655,9 @@ export class CopilotStageExecutor implements AdvisoryStageExecutor {
         ...(builtIns.includes("bash")
           ? [
             "When a public source is summary-only, incomplete, or fails to load, choose the fallback that fits the source: use bash with the installed curl command for static public text; use the installed squad-browser command for JavaScript-rendered content or information revealed by ordinary navigation (clicking links or buttons, filling a non-password search field, pressing Enter, or scrolling).",
-            "squad-browser reads one JSON workflow from standard input: printf '%s' '{\"url\":\"https://example.org/page\",\"steps\":[{\"action\":\"click\",\"role\":\"link\",\"name\":\"Full text\"}]}' | squad-browser. Supported steps are navigate, click, fill, press, scroll, and wait. It opens a fresh headless browser, returns visible page text and visited URLs, and has bounded actions and output.",
+            "If web_fetch returns only a page title, navigation, or an app shell, the page is rendered by JavaScript: read that same page with squad-browser before turning to alternative data endpoints or mirrors. When the request asks what a live page currently shows, cite the squad-browser reading of that page; other sources may corroborate it but do not replace it.",
+            "squad-browser reads one JSON workflow from standard input: printf '%s' '{\"url\":\"https://example.org/page\",\"steps\":[{\"action\":\"click\",\"role\":\"link\",\"name\":\"Full text\"}]}' | squad-browser. Supported steps are navigate, click, fill, press, scroll, and wait. It opens a fresh headless browser, scrolls the page so lazily loaded sections render, and prints one metadata line (title, final and visited URLs) followed by the visible page text and links as plain text, within bounded actions and output.",
+            "Run squad-browser so its output comes straight back to you: do not redirect or pipe it (for example to a file, jq, head, grep or wc). The server records the pages you read from that output; a redirected or filtered run cannot show that you read the live page.",
             "Do not attempt sign-in, submit passwords, bypass paywalls, CAPTCHAs, or access controls. If ordinary public navigation is insufficient, record the limitation as a research gap. Use bounded requests and do not repeatedly retry an unchanged URL.",
           ]
           : ["Shell is disabled for this stage, so do not claim full-text access from a summary; record the limitation as a research gap."]),
@@ -1082,7 +1084,19 @@ export class CopilotStageExecutor implements AdvisoryStageExecutor {
     let source = this.describeSource(toolName, toolArgs);
     if (toolName === "bash") {
       const browserSources = this.browserSources(content);
-      if (browserSources.length > 0) source = `browser-reported: ${browserSources.join(", ")}`.slice(0, 300);
+      if (browserSources.length > 0) {
+        source = `browser-reported: ${browserSources.join(", ")}`.slice(0, 300);
+      } else {
+        // Output piped elsewhere: attribute the receipt to the pages the workflow asked for.
+        const command = text(record(toolArgs).command);
+        const requested = command.includes("squad-browser")
+          ? [...new Set((command.match(/https:\/\/[^\s"'\\]+/g) ?? []).flatMap((url) => {
+            const decision = assessUrl(url, this.options.network);
+            return decision.allowed ? [`${decision.url.origin}${decision.url.pathname}`] : [];
+          }))].slice(0, 12)
+          : [];
+        if (requested.length > 0) source = `browser-output-redirected: ${requested.join(", ")}`.slice(0, 300);
+      }
     }
     if (toolName === "view") {
       const rel = this.projectPath(text(record(toolArgs).path));

@@ -5,9 +5,62 @@ import { chromium } from "/opt/hve-browser/node_modules/playwright/index.mjs";
 import { isNonPublicHost, validateBrowserUrl, validateWorkflow } from "./browser-policy.mjs";
 
 const MAX_INPUT_BYTES = 16 * 1024;
-const MAX_TEXT_CHARS = 12_000;
+const MAX_TEXT_CHARS = 30_000;
 const MAX_LINKS = 30;
 const MAX_WORKFLOW_MS = 35_000;
+const MAX_REVEAL_SCROLLS = 12;
+
+/**
+ * Scroll through the page the way a reader would, so lazily loaded sections
+ * (for example components that render on intersection) are fetched, then let
+ * their requests settle. Bounded in scrolls and time.
+ */
+async function revealLazyContent(page) {
+  for (let index = 0; index < MAX_REVEAL_SCROLLS; index++) {
+    const atBottom = await page.evaluate(() => {
+      window.scrollBy(0, window.innerHeight * 0.9);
+      return window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2;
+    }).catch(() => true);
+    await page.waitForTimeout(250);
+    if (atBottom) break;
+  }
+  await page.waitForLoadState("networkidle", { timeout: 3000 }).catch(() => undefined);
+}
+
+/**
+ * Visible page text, including open shadow roots (web components such as
+ * compatibility tables render there, where `innerText` does not reach).
+ * Runs inside the page, so it must not reference module scope.
+ */
+function visibleText() {
+  const skip = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG"]);
+  const parts = [];
+  const walk = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const value = node.textContent.replace(/\s+/g, " ");
+      if (value.trim()) parts.push(value);
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return;
+    let display = "";
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      if (skip.has(node.tagName.toUpperCase())) return;
+      const style = getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden") return;
+      display = style.display;
+    }
+    const assigned = node.nodeType === Node.ELEMENT_NODE && node.tagName === "SLOT" ? node.assignedNodes({ flatten: true }) : [];
+    const children = assigned.length ? assigned : node.shadowRoot ? [node.shadowRoot] : node.childNodes;
+    const cell = display === "table-cell";
+    const block = !cell && display && !display.startsWith("inline");
+    if (block) parts.push("\n");
+    for (const child of children) walk(child);
+    if (cell) parts.push(" | ");
+    if (block) parts.push("\n");
+  };
+  walk(document.body);
+  return parts.join("").replace(/[ \t]+\n/g, "\n").replace(/\n[ \t]+/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
 
 function allowedHostsFromEnvironment() {
   return (process.env.COPILOT_BROWSER_ALLOWED_HOSTS ?? "")
@@ -228,7 +281,9 @@ async function runWorkflow(workflow) {
       if (blockedNavigation) throw new Error("A browser navigation was blocked by network policy.");
     }
     if (blockedNavigation) throw new Error("A browser navigation was blocked by network policy.");
-    const content = await page.locator("body").innerText({ timeout: 5000 }).catch(() => "");
+    await revealLazyContent(page);
+    if (blockedNavigation) throw new Error("A browser navigation was blocked by network policy.");
+    const content = await page.evaluate(visibleText).catch(() => "");
     // This callback runs inside the page, so the limit must be passed in as an argument.
     const links = await page.locator("a[href]").evaluateAll((anchors, max) => anchors
       .filter((anchor) => anchor instanceof HTMLAnchorElement && anchor.offsetParent !== null)
@@ -239,18 +294,27 @@ async function runWorkflow(workflow) {
       return checked.allowed ? [{ text: link.text, url: safeSourceUrl(checked.url.href) }] : [];
     });
     const visitedUrls = [...new Set([...visited, safeSourceUrl(page.url())])].slice(-12);
-    const output = {
+    // A short metadata line first (the server reads the visited pages from it, even
+    // when the shell truncates long output), then the page as plain readable text.
+    const metadata = {
       kind: "hve-squad-browser",
       title: (await page.title()).slice(0, 300),
       finalUrl: safeSourceUrl(page.url()),
       visitedUrls,
       actions,
       blockedRequests: blocked.slice(0, 10),
-      text: content.slice(0, MAX_TEXT_CHARS),
+      textChars: Math.min(content.length, MAX_TEXT_CHARS),
       truncated: content.length > MAX_TEXT_CHARS,
-      links: visibleLinks,
     };
-    process.stdout.write(`HVE_BROWSER_RESULT ${JSON.stringify(output)}\n`);
+    const linkLines = visibleLinks.map((link) => `- ${link.text || "(no text)"}: ${link.url}`);
+    process.stdout.write([
+      `HVE_BROWSER_RESULT ${JSON.stringify(metadata)}`,
+      "",
+      "--- page text ---",
+      content.slice(0, MAX_TEXT_CHARS),
+      ...(linkLines.length ? ["", "--- visible links ---", ...linkLines] : []),
+      "",
+    ].join("\n"));
   } finally {
     clearTimeout(workflowTimer);
     await context.close().catch(() => undefined);

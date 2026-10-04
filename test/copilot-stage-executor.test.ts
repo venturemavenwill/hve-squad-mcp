@@ -25,7 +25,7 @@ import {
 } from "../src/engine/copilot/session-state-store.js";
 import type { CompletionUsageRecord } from "../src/engine/model-backend.js";
 import type { PersonaRecord } from "../src/engine/persona-loader.js";
-import { StageBlockedError } from "../src/engine/research-runtime.js";
+import { StageBlockedError, TEXT_ONLY_REPORT_LIMITS } from "../src/engine/research-runtime.js";
 import type { Workspace } from "../src/engine/workspace.js";
 import { buildCopilotRuntime } from "../src/server-http.js";
 
@@ -239,7 +239,9 @@ test("a stage writes its artifact through the project filesystem and records ser
     assert.ok(seen.created[0].availableTools.includes("builtin:bash"));
     assert.match(seen.created[0].systemMessage.content, /web_fetch tool may return only an extracted summary or excerpt/);
     assert.match(seen.created[0].systemMessage.content, /use bash with the installed curl command/);
+    assert.match(seen.created[0].systemMessage.content, /do not redirect or pipe it/);
     assert.match(seen.created[0].systemMessage.content, /installed squad-browser command/);
+    assert.match(seen.created[0].systemMessage.content, /app shell, the page is rendered by JavaScript: read that same page with squad-browser/);
     assert.match(seen.created[0].systemMessage.content, /ordinary public navigation/);
     assert.equal(seen.disconnected, 1);
   } finally { await f.cleanup(); }
@@ -250,17 +252,20 @@ test("browser workflow output records the page URLs as source evidence", async (
   const { client } = fakeRuntime(async (agent) => {
     await agent.view("/workspace/input/context.md");
     const command = "printf browser-workflow | squad-browser";
-    const output = 'HVE_BROWSER_RESULT {"kind":"hve-squad-browser","finalUrl":"https://www.rfc-editor.org/rfc/rfc6585","visitedUrls":["https://www.rfc-editor.org/rfc/rfc6585"],"text":"429"}\n<exited with exit code 0>';
+    const output = 'HVE_BROWSER_RESULT {"kind":"hve-squad-browser","finalUrl":"https://www.rfc-editor.org/rfc/rfc6585","visitedUrls":["https://www.rfc-editor.org/rfc/rfc6585"],"textChars":3}\n\n--- page text ---\n429\n<exited with exit code 0>';
     assert.match(await agent.sandbox("bash", { command }, { kind: "shell", fullCommandText: command, possibleUrls: [] }, output) ?? "", /receipt E2/);
-    await agent.write(`/workspace/${RESEARCH_PRIMARY}`, "# Findings\n\nRFC 6585 defines 429 (E1, E2).");
+    const piped = `printf '%s' '{"url":"https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/429"}' | squad-browser > /tmp/page.json && wc -c /tmp/page.json`;
+    assert.match(await agent.sandbox("bash", { command: piped }, { kind: "shell", fullCommandText: piped, possibleUrls: [] }, "18234 /tmp/page.json") ?? "", /receipt E3/);
+    await agent.write(`/workspace/${RESEARCH_PRIMARY}`, "# Findings\n\nRFC 6585 defines 429 (E1, E2, E3).");
     agent.usage({ model: "test-model", inputTokens: 800, outputTokens: 100, apiCallId: "browser-test", finishReason: "stop" });
-    const finish = await agent.custom("finish_stage", { status: "complete", readiness: "ready", summary: "HTTP 429 source checked.", evidenceIds: ["E1", "E2"] });
+    const finish = await agent.custom("finish_stage", { status: "complete", readiness: "ready", summary: "HTTP 429 source checked.", evidenceIds: ["E1", "E2", "E3"] });
     assert.equal(finish.resultType, "success");
   });
   try {
     await f.executor(client).execute(researcher, request);
     const saved = JSON.parse((await f.store.get(TENANT, PROJECT, `${RESEARCH_PRIMARY}.sources.json`))!.content);
     assert.equal(saved.evidence[1].source, "browser-reported: https://www.rfc-editor.org/rfc/rfc6585");
+    assert.equal(saved.evidence[2].source, "browser-output-redirected: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/429");
   } finally { await f.cleanup(); }
 });
 
@@ -415,6 +420,27 @@ test("text-only report mode denies execution, network and delegation and writes 
     assert.equal(result.backendId, COPILOT_BACKEND_ID);
     assert.match((await f.store.get(TENANT, PROJECT, ".copilot-tracking/changes/run-1/artifact.md"))!.content, /unresolved choice remains open/);
     assert.deepEqual(seen.created[0].availableTools.filter((name) => name.startsWith("builtin:")), ["builtin:view"]);
+  } finally { await f.cleanup(); }
+});
+
+test("a report stage has room for its agentic round trips, and its budget error names the report limit", async () => {
+  const f = await fixture();
+  const finishing = fakeRuntime(async (agent) => {
+    // Read research, read plan, write, finish: each round trip is one model call on an agentic runtime.
+    for (let call = 0; call < 6; call++) agent.usage({ inputTokens: 10, outputTokens: 1 });
+    await agent.custom("submit_artifact", { content: "# Report\n\nThe open decision remains open." });
+    const finish = await agent.custom("finish_stage", { status: "complete", readiness: "ready-with-gaps", summary: "Saved.", evidenceIds: [] });
+    assert.equal(finish.resultType, "success", finish.textResultForLlm);
+  });
+  const looping = fakeRuntime((agent) => {
+    for (let call = 0; call < TEXT_ONLY_REPORT_LIMITS.modelCalls + 2; call++) agent.usage({ inputTokens: 10, outputTokens: 1 });
+  });
+  try {
+    await f.executor(finishing.client).execute(implementor, request, "Prior findings.", "developer", undefined, "text-only-report");
+    await assert.rejects(
+      f.executor(looping.client, { runId: "run-2" }).execute(implementor, request, "Prior findings.", "developer", undefined, "text-only-report"),
+      (error: unknown) => error instanceof StageBlockedError && error.reason === "stage_execution_limit" &&
+        error.message.includes(`${TEXT_ONLY_REPORT_LIMITS.modelCalls}-call`));
   } finally { await f.cleanup(); }
 });
 

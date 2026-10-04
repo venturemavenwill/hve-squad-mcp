@@ -95,7 +95,7 @@ export function validateWorkflow(value) {
         throw new Error(`steps[${index}] action is unsupported.`);
     }
   }
-  return value;
+  return { ...value, steps };
 }
 
 function locatorProvided(step) {

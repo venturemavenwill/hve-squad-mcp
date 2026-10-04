@@ -631,6 +631,19 @@ export async function runAdvisoryPipeline(
           };
         }
         if (!(error instanceof StageBlockedError)) throw new AdvisoryStageFailure(stage.role, stages, error);
+        // The backlog handoff is an optional final step: when its agent declines
+        // because the request has nothing to plan (for example a research
+        // question), the reviewed work stands. Runtime failures still halt.
+        if (stage.backlog && error.reason === "stage_blocked") {
+          const section = `## ${stage.role} - skipped\n\n${error.detail}`;
+          stages.push({ kind: "persona", role: stage.role, section, text: section });
+          try {
+            await deps.persistence?.recordStage({ role: stage.role, artifact: section });
+          } catch (persistError) {
+            throw new AdvisoryStageFailure(stage.role, stages, persistError, "persistence");
+          }
+          continue;
+        }
         return {
           outcome: "halted",
           artifact: [compileArtifact(stages), `## ${stage.role} - blocked\n\n${error.detail}`].filter(Boolean).join("\n\n"),
